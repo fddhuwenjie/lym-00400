@@ -1,13 +1,17 @@
+import { SkipList } from "./skiplist";
+
 type StringValue = { value: string; expiresAt: number | null };
 type HashValue = { fields: Map<string, string>; expiresAt: number | null };
 type ListValue = { items: string[]; expiresAt: number | null };
 type SetValue = { members: Set<string>; expiresAt: number | null };
+type ZSetValue = { skiplist: SkipList; dict: Map<string, number>; expiresAt: number | null };
 
 type StoreEntry =
   | { type: "string"; data: StringValue }
   | { type: "hash"; data: HashValue }
   | { type: "list"; data: ListValue }
-  | { type: "set"; data: SetValue };
+  | { type: "set"; data: SetValue }
+  | { type: "zset"; data: ZSetValue };
 
 export class Store {
   private entries = new Map<string, StoreEntry>();
@@ -265,6 +269,145 @@ export class Store {
     return (entry.data as SetValue).members.has(member) ? 1 : 0;
   }
 
+  zadd(key: string, ...scoreMembers: string[]): number | string {
+    if (scoreMembers.length % 2 !== 0) return "ERR syntax error";
+    if (!this.ensureType(key, "zset")) return this.wrongTypeErr();
+
+    let entry = this.checkKey(key) as StoreEntry | undefined;
+    if (!entry) {
+      entry = {
+        type: "zset",
+        data: { skiplist: new SkipList(), dict: new Map(), expiresAt: null },
+      };
+      this.entries.set(key, entry);
+    }
+    const zset = entry.data as ZSetValue;
+    let added = 0;
+
+    for (let i = 0; i < scoreMembers.length; i += 2) {
+      const score = parseFloat(scoreMembers[i]);
+      const member = scoreMembers[i + 1];
+      if (isNaN(score) || !isFinite(score)) return "ERR value is not a valid float";
+
+      const existingScore = zset.dict.get(member);
+      if (existingScore !== undefined) {
+        zset.skiplist.delete(existingScore, member);
+      } else {
+        added++;
+      }
+      zset.skiplist.insert(score, member);
+      zset.dict.set(member, score);
+    }
+
+    return added;
+  }
+
+  zscore(key: string, member: string): string | null {
+    const entry = this.checkKey(key);
+    if (!entry) return null;
+    if (entry.type !== "zset") return null;
+    const zset = entry.data as ZSetValue;
+    const score = zset.dict.get(member);
+    return score !== undefined ? String(score) : null;
+  }
+
+  zrank(key: string, member: string): number | null {
+    const entry = this.checkKey(key);
+    if (!entry) return null;
+    if (entry.type !== "zset") return null;
+    const zset = entry.data as ZSetValue;
+    const score = zset.dict.get(member);
+    if (score === undefined) return null;
+    const rank = zset.skiplist.getRank(score, member);
+    return rank > 0 ? rank - 1 : null;
+  }
+
+  zrange(key: string, start: number, stop: number, withScores: boolean): string[] {
+    const entry = this.checkKey(key);
+    if (!entry) return [];
+    if (entry.type !== "zset") return [];
+    const zset = entry.data as ZSetValue;
+    const size = zset.skiplist.size();
+    let s = start < 0 ? size + start : start;
+    let e = stop < 0 ? size + stop : stop;
+    s = Math.max(0, s);
+    e = Math.min(size - 1, e);
+    if (s > e) return [];
+
+    const result: string[] = [];
+    for (let i = s; i <= e; i++) {
+      const elem = zset.skiplist.getElementByRank(i + 1);
+      if (elem) {
+        result.push(elem.member);
+        if (withScores) result.push(String(elem.score));
+      }
+    }
+    return result;
+  }
+
+  zrangebyscore(key: string, minStr: string, maxStr: string, withScores: boolean): string[] {
+    const entry = this.checkKey(key);
+    if (!entry) return [];
+    if (entry.type !== "zset") return [];
+    const zset = entry.data as ZSetValue;
+
+    let minScore: number;
+    let maxScore: number;
+
+    if (minStr === "-inf") {
+      minScore = -Infinity;
+    } else if (minStr === "+inf") {
+      minScore = Infinity;
+    } else {
+      minScore = parseFloat(minStr);
+      if (isNaN(minScore)) return [];
+    }
+
+    if (maxStr === "+inf") {
+      maxScore = Infinity;
+    } else if (maxStr === "-inf") {
+      maxScore = -Infinity;
+    } else {
+      maxScore = parseFloat(maxStr);
+      if (isNaN(maxScore)) return [];
+    }
+
+    const elements = zset.skiplist.rangeByScore(minScore, maxScore);
+    const result: string[] = [];
+    for (const elem of elements) {
+      result.push(elem.member);
+      if (withScores) result.push(String(elem.score));
+    }
+    return result;
+  }
+
+  zrem(key: string, ...members: string[]): number | string {
+    if (!this.ensureType(key, "zset")) return this.wrongTypeErr();
+    const entry = this.checkKey(key) as StoreEntry | undefined;
+    if (!entry) return 0;
+    const zset = entry.data as ZSetValue;
+    let removed = 0;
+
+    for (const member of members) {
+      const score = zset.dict.get(member);
+      if (score !== undefined) {
+        zset.skiplist.delete(score, member);
+        zset.dict.delete(member);
+        removed++;
+      }
+    }
+
+    return removed;
+  }
+
+  zcard(key: string): number {
+    const entry = this.checkKey(key);
+    if (!entry) return 0;
+    if (entry.type !== "zset") return 0;
+    const zset = entry.data as ZSetValue;
+    return zset.skiplist.size();
+  }
+
   keys(pattern: string): string[] {
     const result: string[] = [];
     const regex = globToRegex(pattern);
@@ -364,6 +507,12 @@ export class Store {
         break;
       case "SADD":
         this.sadd(args[1], ...args.slice(2));
+        break;
+      case "ZADD":
+        this.zadd(args[1], ...args.slice(2));
+        break;
+      case "ZREM":
+        this.zrem(args[1], ...args.slice(2));
         break;
       case "EXPIRE":
         this.expire(args[1], parseInt(args[2], 10));

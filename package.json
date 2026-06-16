@@ -12,5 +12,9 @@
   "devDependencies": {
     "@types/node": "^25.9.3",
     "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "fengari": "^0.1.5",
+    "fengari-interop": "^0.1.4"
   }
 }

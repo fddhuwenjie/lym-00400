@@ -3,6 +3,7 @@ import { RespParser, extractCommand, encodeSimpleString, encodeError, encodeInte
 import { Store } from "./store";
 import { Aof } from "./aof";
 import { PubSub } from "./pubsub";
+import { LuaScriptRunner } from "./lua";
 
 const DEFAULT_PORT = 6380;
 const AOF_PATH = "./data/mini-redis.aof";
@@ -10,6 +11,7 @@ const AOF_PATH = "./data/mini-redis.aof";
 const store = new Store();
 const aof = new Aof(AOF_PATH);
 const pubsub = new PubSub();
+const luaRunner = new LuaScriptRunner(store, aof);
 
 async function main() {
   await aof.replay((args) => store.replayCommand(args));
@@ -345,6 +347,125 @@ function handleCommand(socket: net.Socket, args: string[]) {
       }
       const result = store.sismember(args[1], args[2]);
       socket.write(encodeInteger(result));
+      break;
+    }
+
+    case "ZADD": {
+      if (args.length < 4 || (args.length - 2) % 2 !== 0) {
+        socket.write(encodeError("ERR wrong number of arguments for 'zadd' command"));
+        break;
+      }
+      const result = store.zadd(args[1], ...args.slice(2));
+      if (typeof result === "string" && result.startsWith("ERR")) {
+        socket.write(encodeError(result));
+      } else if (typeof result === "string" && result.startsWith("WRONGTYPE")) {
+        socket.write(encodeError(result));
+      } else {
+        aof.write(args);
+        socket.write(encodeInteger(result as number));
+      }
+      break;
+    }
+
+    case "ZSCORE": {
+      if (args.length < 3) {
+        socket.write(encodeError("ERR wrong number of arguments for 'zscore' command"));
+        break;
+      }
+      const val = store.zscore(args[1], args[2]);
+      socket.write(encodeBulkString(val));
+      break;
+    }
+
+    case "ZRANK": {
+      if (args.length < 3) {
+        socket.write(encodeError("ERR wrong number of arguments for 'zrank' command"));
+        break;
+      }
+      const rank = store.zrank(args[1], args[2]);
+      if (rank === null) {
+        socket.write(encodeBulkString(null));
+      } else {
+        socket.write(encodeInteger(rank));
+      }
+      break;
+    }
+
+    case "ZRANGE": {
+      if (args.length < 4) {
+        socket.write(encodeError("ERR wrong number of arguments for 'zrange' command"));
+        break;
+      }
+      let withScores = false;
+      for (let i = 4; i < args.length; i++) {
+        if (args[i].toUpperCase() === "WITHSCORES") {
+          withScores = true;
+        }
+      }
+      const items = store.zrange(args[1], parseInt(args[2], 10), parseInt(args[3], 10), withScores);
+      socket.write(encodeArray(items));
+      break;
+    }
+
+    case "ZRANGEBYSCORE": {
+      if (args.length < 4) {
+        socket.write(encodeError("ERR wrong number of arguments for 'zrangebyscore' command"));
+        break;
+      }
+      let withScores = false;
+      for (let i = 4; i < args.length; i++) {
+        if (args[i].toUpperCase() === "WITHSCORES") {
+          withScores = true;
+        }
+      }
+      const items = store.zrangebyscore(args[1], args[2], args[3], withScores);
+      socket.write(encodeArray(items));
+      break;
+    }
+
+    case "ZREM": {
+      if (args.length < 3) {
+        socket.write(encodeError("ERR wrong number of arguments for 'zrem' command"));
+        break;
+      }
+      const result = store.zrem(args[1], ...args.slice(2));
+      if (typeof result === "string" && result.startsWith("WRONGTYPE")) {
+        socket.write(encodeError(result));
+      } else {
+        if ((result as number) > 0) aof.write(args);
+        socket.write(encodeInteger(result as number));
+      }
+      break;
+    }
+
+    case "ZCARD": {
+      if (args.length < 2) {
+        socket.write(encodeError("ERR wrong number of arguments for 'zcard' command"));
+        break;
+      }
+      const count = store.zcard(args[1]);
+      socket.write(encodeInteger(count));
+      break;
+    }
+
+    case "EVAL": {
+      if (args.length < 3) {
+        socket.write(encodeError("ERR wrong number of arguments for 'eval' command"));
+        break;
+      }
+      const script = args[1];
+      const numKeys = parseInt(args[2], 10);
+      if (isNaN(numKeys)) {
+        socket.write(encodeError("ERR value is not an integer or out of range"));
+        break;
+      }
+      const scriptArgs = args.slice(3);
+      try {
+        const result = luaRunner.eval(script, numKeys, ...scriptArgs);
+        socket.write(result);
+      } catch (e: any) {
+        socket.write(encodeError(`ERR ${e.message}`));
+      }
       break;
     }
 

@@ -100,10 +100,17 @@ export class Aof {
     return commands;
   }
 
-  close() {
-    if (this.stream) {
-      this.stream.end();
-      this.stream = null;
-    }
+  close(): Promise<void> {
+    return new Promise((resolve) => {
+      if (this.stream) {
+        this.stream.on("finish", () => {
+          this.stream = null;
+          resolve();
+        });
+        this.stream.end();
+      } else {
+        resolve();
+      }
+    });
   }
 }
